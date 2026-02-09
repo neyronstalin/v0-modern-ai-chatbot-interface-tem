@@ -1,6 +1,6 @@
 "use client"
 
-import React, { useEffect, useMemo, useRef, useState } from "react"
+import React, { useEffect, useMemo, useRef, useState, useCallback } from "react"
 import { Calendar, LayoutGrid, MoreHorizontal } from "lucide-react"
 import Sidebar from "./Sidebar"
 import Header from "./Header"
@@ -8,6 +8,8 @@ import ChatPane from "./ChatPane"
 import GhostIconButton from "./GhostIconButton"
 import ThemeToggle from "./ThemeToggle"
 import { INITIAL_CONVERSATIONS, INITIAL_TEMPLATES, INITIAL_FOLDERS } from "./mockData"
+
+const MODEL_STORAGE_KEY = "chat-selected-model"
 
 export default function AIAssistantUI() {
   const [theme, setTheme] = useState(() => {
@@ -79,8 +81,24 @@ export default function AIAssistantUI() {
   const [query, setQuery] = useState("")
   const searchRef = useRef(null)
 
-  const [isThinking, setIsThinking] = useState(false)
-  const [thinkingConvId, setThinkingConvId] = useState(null)
+  const [isStreaming, setIsStreaming] = useState(false)
+  const [streamingConvId, setStreamingConvId] = useState(null)
+  const abortControllerRef = useRef(null)
+
+  const [selectedModel, setSelectedModel] = useState(() => {
+    try {
+      return localStorage.getItem(MODEL_STORAGE_KEY) || "google/gemini-2.0-flash-001"
+    } catch {
+      return "google/gemini-2.0-flash-001"
+    }
+  })
+
+  const handleModelChange = useCallback((model) => {
+    setSelectedModel(model)
+    try {
+      localStorage.setItem(MODEL_STORAGE_KEY, model)
+    } catch {}
+  }, [])
 
   useEffect(() => {
     const onKey = (e) => {
@@ -140,7 +158,7 @@ export default function AIAssistantUI() {
       preview: "Say hello to start...",
       pinned: false,
       folder: "Work Projects",
-      messages: [], // Ensure messages array is empty for new chats
+      messages: [],
     }
     setConversations((prev) => [item, ...prev])
     setSelectedId(id)
@@ -154,55 +172,129 @@ export default function AIAssistantUI() {
     setFolders((prev) => [...prev, { id: Math.random().toString(36).slice(2), name }])
   }
 
-  function sendMessage(convId, content) {
-    if (!content.trim()) return
-    const now = new Date().toISOString()
-    const userMsg = { id: Math.random().toString(36).slice(2), role: "user", content, createdAt: now }
+  // Real AI streaming send message
+  const sendMessage = useCallback(
+    async (convId, content, imageData) => {
+      if ((!content.trim() && !imageData) || isStreaming) return
 
-    setConversations((prev) =>
-      prev.map((c) => {
-        if (c.id !== convId) return c
-        const msgs = [...(c.messages || []), userMsg]
-        return {
-          ...c,
-          messages: msgs,
-          updatedAt: now,
-          messageCount: msgs.length,
-          preview: content.slice(0, 80),
-        }
-      }),
-    )
+      const now = new Date().toISOString()
+      const userMsgId = Math.random().toString(36).slice(2)
+      const assistantMsgId = Math.random().toString(36).slice(2)
 
-    setIsThinking(true)
-    setThinkingConvId(convId)
+      const userMsg = { id: userMsgId, role: "user", content: content.trim() || "Describe this image", createdAt: now, imageData }
+      const assistantMsg = { id: assistantMsgId, role: "assistant", content: "", createdAt: now }
 
-    const currentConvId = convId
-    setTimeout(() => {
-      // Always clear thinking state and generate response for this specific conversation
-      setIsThinking(false)
-      setThinkingConvId(null)
+      // Add user message and empty assistant message
       setConversations((prev) =>
         prev.map((c) => {
-          if (c.id !== currentConvId) return c
-          const ack = `Got it — I'll help with that.`
-          const asstMsg = {
-            id: Math.random().toString(36).slice(2),
-            role: "assistant",
-            content: ack,
-            createdAt: new Date().toISOString(),
-          }
-          const msgs = [...(c.messages || []), asstMsg]
+          if (c.id !== convId) return c
+          const msgs = [...(c.messages || []), userMsg, assistantMsg]
+          // Auto-title based on first user message
+          const title = c.messages?.length === 0 ? content.slice(0, 60) || c.title : c.title
           return {
             ...c,
+            title,
             messages: msgs,
-            updatedAt: new Date().toISOString(),
+            updatedAt: now,
             messageCount: msgs.length,
-            preview: asstMsg.content.slice(0, 80),
+            preview: content.slice(0, 80),
           }
         }),
       )
-    }, 2000)
-  }
+
+      setIsStreaming(true)
+      setStreamingConvId(convId)
+
+      const controller = new AbortController()
+      abortControllerRef.current = controller
+
+      try {
+        // Get current messages for context
+        const currentConv = conversations.find((c) => c.id === convId)
+        const allMessages = [...(currentConv?.messages || []), userMsg]
+
+        const response = await fetch("/api/chat", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            messages: allMessages.map((m) => ({
+              role: m.role,
+              content: m.content,
+              imageData: m.imageData,
+            })),
+            model: selectedModel,
+          }),
+          signal: controller.signal,
+        })
+
+        if (!response.ok) {
+          throw new Error(`HTTP error! status: ${response.status}`)
+        }
+
+        const reader = response.body?.getReader()
+        const decoder = new TextDecoder()
+
+        if (!reader) throw new Error("No response body")
+
+        let accumulatedContent = ""
+
+        while (true) {
+          const { done, value } = await reader.read()
+          if (done) break
+
+          const chunk = decoder.decode(value, { stream: true })
+          accumulatedContent += chunk
+
+          setConversations((prev) =>
+            prev.map((c) => {
+              if (c.id !== convId) return c
+              return {
+                ...c,
+                messages: c.messages.map((msg) =>
+                  msg.id === assistantMsgId ? { ...msg, content: accumulatedContent } : msg,
+                ),
+                preview: accumulatedContent.slice(0, 80),
+                updatedAt: new Date().toISOString(),
+              }
+            }),
+          )
+        }
+      } catch (e) {
+        if (e.name === "AbortError") {
+          setConversations((prev) =>
+            prev.map((c) => {
+              if (c.id !== convId) return c
+              return {
+                ...c,
+                messages: c.messages.map((msg) =>
+                  msg.id === assistantMsgId
+                    ? { ...msg, content: msg.content || "[Cancelled]" }
+                    : msg,
+                ),
+              }
+            }),
+          )
+        } else {
+          console.error("Error sending message:", e)
+          // Remove empty assistant message on error
+          setConversations((prev) =>
+            prev.map((c) => {
+              if (c.id !== convId) return c
+              return {
+                ...c,
+                messages: c.messages.filter((msg) => msg.id !== assistantMsgId),
+              }
+            }),
+          )
+        }
+      } finally {
+        setIsStreaming(false)
+        setStreamingConvId(null)
+        abortControllerRef.current = null
+      }
+    },
+    [conversations, isStreaming, selectedModel],
+  )
 
   function editMessage(convId, messageId, newContent) {
     const now = new Date().toISOString()
@@ -225,17 +317,16 @@ export default function AIAssistantUI() {
     const conv = conversations.find((c) => c.id === convId)
     const msg = conv?.messages?.find((m) => m.id === messageId)
     if (!msg) return
-    sendMessage(convId, msg.content)
+    sendMessage(convId, msg.content, msg.imageData)
   }
 
-  function pauseThinking() {
-    setIsThinking(false)
-    setThinkingConvId(null)
+  function stopStreaming() {
+    if (abortControllerRef.current) {
+      abortControllerRef.current.abort()
+    }
   }
 
   function handleUseTemplate(template) {
-    // This will be passed down to the Composer component
-    // The Composer will handle inserting the template content
     if (composerRef.current) {
       composerRef.current.insertTemplate(template.content)
     }
@@ -247,9 +338,9 @@ export default function AIAssistantUI() {
 
   return (
     <div className="h-screen w-full bg-zinc-50 text-zinc-900 dark:bg-zinc-950 dark:text-zinc-100">
-      <div className="md:hidden sticky top-0 z-40 flex items-center gap-2 border-b border-zinc-200/60 bg-white/80 px-3 py-2 backdrop-blur dark:border-zinc-800 dark:bg-zinc-900/70">
+      <div className="md:hidden sticky top-0 z-40 flex items-center gap-2 border-b border-zinc-200/60 bg-zinc-50/80 px-3 py-2 backdrop-blur dark:border-zinc-800 dark:bg-zinc-900/70">
         <div className="ml-1 flex items-center gap-2 text-sm font-semibold tracking-tight">
-          <span className="inline-flex h-4 w-4 items-center justify-center">✱</span> AI Assistant
+          <span className="inline-flex h-4 w-4 items-center justify-center">*</span> AI Assistant
         </div>
         <div className="ml-auto flex items-center gap-2">
           <GhostIconButton label="Schedule">
@@ -294,15 +385,23 @@ export default function AIAssistantUI() {
         />
 
         <main className="relative flex min-w-0 flex-1 flex-col">
-          <Header createNewChat={createNewChat} sidebarCollapsed={sidebarCollapsed} setSidebarOpen={setSidebarOpen} />
+          <Header
+            createNewChat={createNewChat}
+            sidebarCollapsed={sidebarCollapsed}
+            setSidebarOpen={setSidebarOpen}
+            selectedModel={selectedModel}
+            onModelChange={handleModelChange}
+          />
           <ChatPane
             ref={composerRef}
             conversation={selected}
-            onSend={(content) => selected && sendMessage(selected.id, content)}
+            onSend={(content, imageData) => selected && sendMessage(selected.id, content, imageData)}
             onEditMessage={(messageId, newContent) => selected && editMessage(selected.id, messageId, newContent)}
             onResendMessage={(messageId) => selected && resendMessage(selected.id, messageId)}
-            isThinking={isThinking && thinkingConvId === selected?.id}
-            onPauseThinking={pauseThinking}
+            isThinking={isStreaming && streamingConvId === selected?.id}
+            onPauseThinking={stopStreaming}
+            selectedModel={selectedModel}
+            onModelChange={handleModelChange}
           />
         </main>
       </div>
